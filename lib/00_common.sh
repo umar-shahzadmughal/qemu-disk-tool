@@ -10,21 +10,23 @@ NBD_MAX=2
 USED_NBDS=()
 NBD_LOADED_BY_US=0  # Track if WE loaded the nbd module
 LOG_FILE="${HOME}/.qemu-disk-tool.log"
+CLEANUP_HOOKS=()    # LIFO: functions to run on exit (register_cleanup pushes)
 
 check_nbd_module() {
+  [[ "${_NBD_CHECKED:-0}" -eq 1 ]] && return 0
   echo
   echo "🧩 Kernel module check: nbd"
 
   command -v modprobe >/dev/null 2>&1 || {
-    echo "  ❌ modprobe not found (install kmod)."
+    echo "  🚫 modprobe not found (install kmod)."
     return 1
   }
 
   if [[ -d /sys/module/nbd ]]; then
     if [[ "${NBD_LOADED_BY_US:-0}" -eq 1 ]]; then
-      echo "  ✅ nbd module loaded by this script."
+      echo "  🔌 nbd module loaded by this script."
     else
-      echo "  ✅ nbd module already loaded (not by us)."
+      echo "  🔗 nbd module already loaded (not by us)."
       NBD_LOADED_BY_US=0
     fi
   else
@@ -32,11 +34,11 @@ check_nbd_module() {
     modprobe nbd max_part=16 2>/dev/null || true
 
     [[ -d /sys/module/nbd ]] || {
-      echo "  ❌ nbd module is not loaded and could not be loaded."
+      echo "  🚫 nbd module is not loaded and could not be loaded."
       return 1
     }
     NBD_LOADED_BY_US=1
-    echo "  ✅ nbd module loaded by this script."
+    echo "  🔌 nbd module loaded by this script."
   fi
 
   local mp nb
@@ -46,24 +48,25 @@ check_nbd_module() {
   [[ "$mp" =~ ^[0-9]+$ ]] || mp=0
 
   if (( mp == 0 )); then
-    echo "  ❌ nbd loaded but partition support looks disabled (max_part=$mp)."
+    echo "  🚫 nbd loaded but partition support looks disabled (max_part=$mp)."
     echo "     Fix: sudo rmmod nbd && sudo modprobe nbd max_part=16"
     return 1
   fi
 
   if (( mp < 16 )); then
-    echo "  ❌ nbd max_part too low: $mp (need >= 16)."
+    echo "  🚫 nbd max_part too low: $mp (need >= 16)."
     echo "     Fix: sudo rmmod nbd && sudo modprobe nbd max_part=16"
     return 1
   fi
 
   if (( mp != 16 )); then
-    echo "  🟨 nbd loaded (nbds_max=$nb) and max_part=$mp."
-    echo "     That’s OK (many kernels round 16 → 31)."
+    echo "  🧩 nbd loaded (nbds_max=$nb) and max_part=$mp."
+    echo "     That's OK (many kernels round 16 → 31)."
   else
-    echo "  ✅ nbd loaded (nbds_max=$nb) and max_part=$mp."
+    echo "  🔌 nbd loaded (nbds_max=$nb) and max_part=$mp."
   fi
 
+  _NBD_CHECKED=1
   return 0
 }
 
@@ -79,7 +82,7 @@ preflight_check() {
     echo "🟨 Auto-install supported on Ubuntu/Debian only. Detected: $dist"
   fi
 
-  local required=(qemu-img qemu-nbd lsblk findmnt mount umount mountpoint partprobe dd truncate modprobe udevadm blockdev numfmt script rsync sgdisk ntfs-3g smartctl resize2fs partclone.ext4 partclone.ntfs)
+  local required=(qemu-img qemu-nbd lsblk findmnt mount umount mountpoint partprobe dd truncate modprobe udevadm blockdev numfmt script rsync sgdisk ntfs-3g smartctl resize2fs mkfs.ext4 mkfs.vfat partclone.ext4 partclone.ntfs)
   local optional=(pv zenity ms-sys)
 
   echo "🔎 Checking required tools…"
@@ -108,6 +111,7 @@ preflight_check() {
   offer_optional_install() {
     ((${#missing_optional[@]} > 0)) || return 0
     [[ "$dist" == "ubuntu" || "$dist" == "debian" ]] || return 0
+    local ans opt_pkgs install_ms_sys tmp_dir cwd_save
 
     echo
     echo "🟨 Missing optional tools:"
@@ -122,8 +126,8 @@ preflight_check() {
     echo
     read -rp "🛠️  Install missing optional tools now? (y/N): " ans <"$TTY"
     if [[ "${ans,,}" == "y" ]]; then
-      local opt_pkgs=()
-      local install_ms_sys=false
+      opt_pkgs=()
+      install_ms_sys=false
       for c in "${missing_optional[@]}"; do
         case "$c" in
           pv)     opt_pkgs+=("pv") ;;
@@ -204,7 +208,8 @@ preflight_check() {
         sgdisk)                         pkgs+=("gdisk") ;;
         ntfs-3g)                        pkgs+=("ntfs-3g") ;;
         smartctl)                       pkgs+=("smartmontools") ;;
-        resize2fs)                      pkgs+=("e2fsprogs") ;;
+        resize2fs|mkfs.ext4)            pkgs+=("e2fsprogs") ;;
+        mkfs.vfat)                      pkgs+=("dosfstools") ;;
         partclone.ext4|partclone.ntfs)  pkgs+=("partclone") ;;
         ms-sys)                          pkgs+=("ms-sys") ;;
         *)                              pkgs+=("$c") ;;
@@ -273,26 +278,25 @@ _write_log() {
 }
 
 # --------- Helpers ---------
-log()  { echo -e "${BLUE}🟦 $*${NC}"; _write_log "INFO" "$*"; }
-warn() { echo -e "${YELLOW}🟨 $*${NC}"; _write_log "WARN" "$*"; }
-err()  { echo -e "${RED}🟥 $*${NC}" >&2; _write_log "ERROR" "$*"; }
-die()  { err "$*"; exit 1; }
-success() { echo -e "${GREEN}✅ $*${NC}"; _write_log "SUCCESS" "$*"; }
-info()   { echo -e "${CYAN}ℹ️  $*${NC}"; _write_log "INFO" "$*"; }
+# ALL human-facing messages go to stderr by design:
+# any helper can then be safely called inside $(…) — stdout stays
+# reserved exclusively for return values (paths, sizes, booleans).
+log()     { echo -e "${BLUE}⚙️  $*${NC}" >&2;    _write_log "INFO"    "$*"; }
+warn()    { echo -e "${YELLOW}⚠️  $*${NC}" >&2;  _write_log "WARN"    "$*"; }
+err()     { echo -e "${RED}❌ $*${NC}" >&2;      _write_log "ERROR"   "$*"; }
+die()     { err "$*"; exit 1; }
+success() { echo -e "${GREEN}✅ $*${NC}" >&2;    _write_log "SUCCESS" "$*"; }
+info()    { echo -e "${CYAN}ℹ️  $*${NC}" >&2;    _write_log "INFO"    "$*"; }
+tip()     { echo -e "${CYAN}💡 Tip: $*${NC}" >&2; _write_log "INFO"    "TIP: $*"; }
 
 have(){ command -v "$1" >/dev/null 2>&1; }
-ver(){
-  case "$1" in
-    qemu-img)  qemu-img --version 2>/dev/null | head -n1 ;;
-    qemu-nbd)  qemu-nbd --version 2>/dev/null | head -n1 ;;
-    lsblk)     lsblk --version 2>/dev/null | head -n1 ;;
-    partprobe) partprobe --version 2>/dev/null | head -n1 ;;
-    dd)        dd --version 2>/dev/null | head -n1 ;;
-    pv)        pv --version 2>/dev/null | head -n1 ;;
-    sgdisk)    sgdisk --version 2>/dev/null | head -n1 ;;
-    ntfs-3g)   ntfs-3g --version 2>/dev/null | head -n1 ;;
-    *)         "$1" --version 2>/dev/null | head -n1 ;;
-  esac
+ver() {
+  local out
+  out="$("$1" --version 2>/dev/null | head -n1)"
+  [[ -n "$out" ]] && { echo "$out"; return; }
+  out="$("$1" -V 2>/dev/null | head -n1)"
+  [[ -n "$out" ]] && { echo "$out"; return; }
+  echo "(installed)"
 }
 
 # ============================================================
@@ -308,6 +312,19 @@ _pb_sectors_written() {            # $1=/dev/xxx → stat field 7
   [[ -n "$f" ]] || return 1
   local s
   read -r _ _ _ _ _ _ s _ < "$f" || return 1
+  [[ "$s" =~ ^[0-9]+$ ]] || return 1
+  echo "$s"
+}
+
+_pb_sectors_read() {               # $1=/dev/xxx → stat field 3 (sectors READ)
+  local name="${1#/dev/}" f="" d
+  if [[ -r "/sys/block/$name/stat" ]]; then f="/sys/block/$name/stat"
+  else
+    for d in /sys/block/*; do [[ -r "$d/$name/stat" ]] && { f="$d/$name/stat"; break; }; done
+  fi
+  [[ -n "$f" ]] || return 1
+  local s
+  read -r _ _ s _ < "$f" || return 1
   [[ "$s" =~ ^[0-9]+$ ]] || return 1
   echo "$s"
 }
@@ -354,10 +371,13 @@ run_with_progress_bar() {
   # ── progress source ──
   local tot="${PB_TOTAL:-$total}"
   [[ "$tot" =~ ^[0-9]+$ ]] || tot=0
-  local have_dev=0 s0=0
+  local have_dev=0 s0=0 dev_mode=""
   if [[ -n "${PB_DEV:-}" && -b "${PB_DEV}" && "$tot" -gt 0 ]]; then
     s0="$(_pb_sectors_written "$PB_DEV" 2>/dev/null || echo X)"
-    [[ "$s0" =~ ^[0-9]+$ ]] && have_dev=1
+    [[ "$s0" =~ ^[0-9]+$ ]] && { have_dev=1; dev_mode="write"; }
+  elif [[ -n "${PB_SRC:-}" && -b "${PB_SRC}" && "$tot" -gt 0 ]]; then
+    s0="$(_pb_sectors_read "$PB_SRC" 2>/dev/null || echo X)"
+    [[ "$s0" =~ ^[0-9]+$ ]] && { have_dev=1; dev_mode="read"; }
   fi
 
   # ── header: centered action sentence with breathing room ──
@@ -376,28 +396,64 @@ run_with_progress_bar() {
   (( ${#src} > maxw )) && src="…${src: -maxw}"
   (( ${#dst} > maxw )) && dst="${dst:0:maxw}…"
   
-  local vis_len=$(( ${#action} + ${#src} + ${#dst} + 8 ))
-  local pad_left=$(( (cols - vis_len) / 2 )); (( pad_left < 1 )) && pad_left=1
-  local pad_spaces=""; for ((i=0; i<pad_left; i++)); do pad_spaces+=" "; done
+  # centering helper: fills global _PB_PAD with left padding
+  _pb_pad() {
+    local w="$1" n="$2" p i out=""
+    p=$(( (w - n) / 2 )); (( p < 1 )) && p=1
+    for ((i=0; i<p; i++)); do out+=" "; done
+    printf -v _PB_PAD '%s' "$out"
+  }
 
   echo
   if [[ -n "$dst" ]]; then
-    printf '%s%s %s%s%s %s%s%s  %s→%s  %s%s%s\n' "$pad_spaces" "$emo" "$BLD" "$action" "$RST" "$WHT" "$src" "$RST" "$DIM" "$RST" "$WHT" "$dst" "$RST"
+    _pb_pad "$cols" $(( ${#action} + 3 ))
+    printf '%s%s %s%s%s\n' "$_PB_PAD" "$emo" "$BLD" "$action" "$RST"
+    _pb_pad "$cols" $(( ${#src} + ${#dst} + 5 ))
+    printf '%s%s%s%s  %s→%s  %s%s%s\n' "$_PB_PAD" "$WHT" "$src" "$RST" "$DIM" "$RST" "$WHT" "$dst" "$RST"
+    if [[ -n "${PB_SUBLINE:-}" ]]; then
+      _pb_pad "$cols" $(( ${#PB_SUBLINE} ))
+      printf '%s%s%s%s\n' "$_PB_PAD" "$DIM" "$PB_SUBLINE" "$RST"
+    fi
   else
-    printf '%s%s %s%s%s %s%s%s\n' "$pad_spaces" "$emo" "$BLD" "$action" "$RST" "$WHT" "$src" "$RST"
+    _pb_pad "$cols" $(( ${#src} + 3 ))
+    printf '%s%s %s%s%s %s%s%s\n' "$_PB_PAD" "$emo" "$BLD" "$action" "$RST" "$WHT" "$src" "$RST"
   fi
   echo
 
-  "${cmd[@]}" </dev/null >"$plog" 2>&1 &
+  local pgid_kill=0
+  if have setsid; then
+    setsid "${cmd[@]}" </dev/null >"$plog" 2>&1 &
+    pgid_kill=1
+  else
+    "${cmd[@]}" </dev/null >"$plog" 2>&1 &
+  fi
   local pid=$!
+  if (( pgid_kill )); then
+    _PB_LAST_PGD="$pid"
+    cleanup_unregister _pb_kill_last 2>/dev/null
+    register_cleanup _pb_kill_last
+  fi
+  # signal helper: whole group when setsid, else pid-tree
+  _pb_signal() {
+    if (( pgid_kill )); then kill -"$1" -"$pid" 2>/dev/null || kill_tree "$pid" "$1"
+    else kill_tree "$pid" "$1"; fi
+  }
 
   local t0 now_ms prev_ms=0
   t0="$(_pb_now_ms)"
+  
+  # Graceful interrupt: kill the WHOLE tree (script → sh → qemu-img),
+  # or cancelled runs leave orphan readers/writers starving later runs
+  local _pb_interrupted=0 _pb_int_at=0 _pb_escalated=0
+  local _pb_prev_trap; _pb_prev_trap="$(trap -p INT TERM HUP)"
+  trap '_pb_interrupted=1; _pb_int_at=$(( $(_pb_now_ms) - t0 )); _pb_signal INT' INT TERM HUP
+  
   local ms_prev=$t0 bytes_prev=0 speed=0
   local last_p=0 last_t=$t0 rate=0
   local eta_base=-1 eta_at=0 eta_rev=0 eta_cd=0
   local -a FR=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
   local now ms written=0 pct=0 chunk content
+  local stall_warned=0 last_advance=$t0 prev_written=0
 
   while kill -0 "$pid" 2>/dev/null; do
     now="$(_pb_now_ms)"; ms=$(( now - t0 ))
@@ -405,30 +461,48 @@ run_with_progress_bar() {
     # Monotonic time guard
     (( ms < prev_ms )) && ms=$prev_ms
     prev_ms=$ms
+    # Space-watchdog flag → treat exactly like Ctrl+C (signal-free, race-free)
+    if (( ! _pb_interrupted )) && [[ -f "/run/qemu-disk-tool/space-watchdog.$$" ]]; then
+      _pb_interrupted=1; _pb_int_at=$ms; _pb_signal INT
+    fi
+    # Cancel requested but child still alive after 3s → escalate to KILL (once)
+    if (( _pb_interrupted )) && (( ! _pb_escalated )) && (( ms - _pb_int_at > 3000 )); then
+      _pb_escalated=1
+      _pb_signal KILL
+      local _w=0
+      while kill -0 "$pid" 2>/dev/null && (( _w < 30 )); do sleep 0.1; _w=$(( _w + 1 )); done
+    fi
 
     if (( have_dev )); then
-      local s; s="$(_pb_sectors_written "$PB_DEV" 2>/dev/null || echo "$s0")"
+      local s
+      if [[ "$dev_mode" == "read" ]]; then
+        s="$(_pb_sectors_read "$PB_SRC" 2>/dev/null || echo "$s0")"
+      else
+        s="$(_pb_sectors_written "$PB_DEV" 2>/dev/null || echo "$s0")"
+      fi
       [[ "$s" =~ ^[0-9]+$ ]] || s=$s0
       written=$(( (s - s0) * 512 )); (( written < 0 )) && written=0
       pct=$(( written * 10000 / tot ))
     else
-      content="$(<"$plog")" 2>/dev/null || content=""
-      chunk="${content: -400}"
-      chunk="${chunk//$'\r'/$'\n'}"
-      local np="" bytes_now=-1 p100=-1
-      if   [[ "$chunk" =~ .*\(([0-9]+(\.[0-9]+)?)/100%\) ]]; then np="${BASH_REMATCH[1]}"
-      elif [[ "$tot" -gt 0 && "$chunk" =~ ([0-9]+)[[:space:]]bytes.*copied ]]; then bytes_now=${BASH_REMATCH[1]}
-      elif [[ "$chunk" =~ ([0-9]+(\.[0-9]+)?)% ]]; then np="${BASH_REMATCH[1]}"
-      fi
-      if (( bytes_now >= 0 )); then
-        p100=$(( bytes_now * 10000 / tot ))
-      elif [[ -n "$np" ]]; then
+      # Use grep to find the latest progress percentage reliably
+      local np=""
+      np="$(grep -o '([0-9.]\+/100%)' "$plog" 2>/dev/null | tail -n1 | tr -d '()' | cut -d'/' -f1 || true)"
+      local p100=-1
+      if [[ -n "$np" ]]; then
         if [[ "$np" == *.* ]]; then
           local ip=${np%%.*} fp=${np#*.}; fp=${fp:0:2}
           (( ${#fp} == 1 )) && fp+=0
           p100=$(( 10#$ip * 100 + 10#$fp ))
         else
           p100=$(( 10#$np * 100 ))
+        fi
+      fi
+      # Fallback for "bytes copied" style output (dd, rsync, etc.)
+      if (( p100 < 0 && tot > 0 )); then
+        local bytes_now
+        bytes_now="$(grep -oE '[0-9]+ bytes.*copied' "$plog" 2>/dev/null | tail -n1 | awk '{print $1}' || true)"
+        if [[ "$bytes_now" =~ ^[0-9]+$ ]]; then
+          p100=$(( bytes_now * 10000 / tot ))
         fi
       fi
       if (( p100 > last_p )); then
@@ -450,6 +524,17 @@ run_with_progress_bar() {
       local inst=$(( db * 1000 / dms ))
       speed=$(( (speed*7 + inst*3) / 10 ))
       ms_prev=$now; bytes_prev=$written
+    fi
+
+    # ── stall watchdog: alive but nothing moving → show WHY ──
+    if (( written > prev_written )); then prev_written=$written; last_advance=$now; fi
+    if (( ! stall_warned && now - last_advance > 180000 )); then
+      stall_warned=1
+      { echo
+        echo "   ⚠️  No progress for 3 minutes — last command output:"
+        tr '\r' '\n' < "$plog" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 5 | sed 's/^/   │ /'
+        echo "   (still waiting… Ctrl+C cancels and cleans up)"
+      } >&2
     fi
 
     # ── draw (gapped cells) ──
@@ -492,9 +577,15 @@ run_with_progress_bar() {
     (( eta_cd < 0 )) && eta_cd=0
 
     local pctstr; printf -v pctstr '%d.%02d' $((pct/100)) $((pct%100))
-    _pb_human "$speed";   local spd_s="$PB_H"
-    _pb_human "$written"; local wr_s="$PB_H"
-    _pb_human "$tot";     local tot_s="$PB_H"
+    _pb_human "$speed"; local spd_s="$PB_H"
+
+    local display_written="$written"
+    if (( tot > 0 && display_written > tot )); then
+      display_written="$tot"
+    fi
+
+    _pb_human "$display_written"; local wr_s="$PB_H"
+    _pb_human "$tot";             local tot_s="$PB_H"
     _pb_hms "$elapsed_s"; local el_s="$PB_T"
     _pb_hms "$eta_cd";    local et_s="$PB_T"
 
@@ -507,7 +598,13 @@ run_with_progress_bar() {
     sleep 0.2
   done
 
-  local rc=0; wait "$pid" || rc=$?
+  local rc=0
+  if (( _pb_interrupted )); then
+    wait "$pid" 2>/dev/null || true
+    rc=130
+  else
+    wait "$pid" || rc=$?
+  fi
   now_ms="$(_pb_now_ms)"
   local elapsed_s=$(( (now_ms - t0) / 1000 ))
   (( elapsed_s < prev_ms / 1000 )) && elapsed_s=$(( prev_ms / 1000 ))
@@ -530,8 +627,22 @@ run_with_progress_bar() {
       "$DIM" "$RST" "$BLD" "$RST" "$DIM" "$RST" "$WHT" "$fill" "$DIM" "$RST" "$pad" "" "$l2"
   else
     printf '\r\033[K  %sFAILED%s (exit %d) after %s\n' "$BLD" "$RST" "$rc" "$el_s"
+    if [[ -s "$plog" ]]; then
+      local tail_n=8; (( rc == 11 )) && tail_n=3   # caller prints a tailored diagnosis for 11
+      echo "   ── last command output ──"
+      tr '\r' '\n' < "$plog" | grep -v '^[[:space:]]*$' | tail -n "$tail_n" | sed 's/^/   │ /'
+    fi
   fi
-  rm -f "$plog"
+  _pb_signal KILL                # belt-and-braces: no survivors
+  local _w2=0
+  while kill -0 "$pid" 2>/dev/null && (( _w2 < 30 )); do sleep 0.1; _w2=$(( _w2 + 1 )); done
+  _PB_LAST_PGD=""
+  if (( rc == 0 || rc == 130 )); then
+    rm -f "$plog"; _PB_LAST_LOG=""
+  else
+    _PB_LAST_LOG="$plog"         # kept for caller diagnostics (next run truncates it)
+  fi
+  if [[ -n "$_pb_prev_trap" ]]; then eval "$_pb_prev_trap"; else trap 'exit 130' INT TERM HUP; fi
   return $rc
 }
 
@@ -632,6 +743,87 @@ need_root() {
 
 pause() { read -rp "⏎ Press Enter to continue… " _ <"$TTY" || true; }
 
+# Engine backstop: kill the last engine process GROUP on any exit (terminal close, Ctrl+C, crash)
+_PB_LAST_PGD=""
+_PB_LAST_LOG=""   # engine keeps the child's output log here after a FAILED run
+_pb_kill_last() {
+  [[ -n "${_PB_LAST_PGD:-}" ]] && kill -KILL -"$_PB_LAST_PGD" 2>/dev/null
+  _PB_LAST_PGD=""
+}
+
+# ── Space watchdog: stops the tool BEFORE ENOSPC destroys a multi-hour run ──
+# ── Space watchdog: sets a flag when free space drops below a threshold ──
+#
+# The engine polls ONE shared per-run flag. Multiple watchdog instances may
+# watch different filesystems (for example outer destination + inner qcow2
+# filesystem) and they all use the same flag. The first trigger records the
+# reason in the flag file; the caller can read it after run_with_progress_bar.
+#
+# $1 = directory / mountpoint to watch
+# $2 = threshold bytes
+# $3 = optional human-readable label, e.g. "outer destination" / "inner target"
+start_space_watchdog() {
+  local dir="$1"
+  local thr="$2"
+  local label="${3:-filesystem}"
+  local me="$$" f pid flag wd_pid
+
+  [[ -n "$dir" ]] || return 1
+  [[ "$thr" =~ ^[0-9]+$ ]] || return 1
+
+  flag="/run/qemu-disk-tool/space-watchdog.$me"
+
+  # Clean stale flags left behind by SIGKILLed runs.
+  for f in /run/qemu-disk-tool/space-watchdog.*; do
+    [[ -f "$f" ]] || continue
+    pid="${f##*.}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    rm -f "$f"
+  done
+
+  mkdir -p /run/qemu-disk-tool 2>/dev/null || return 1
+
+  (
+    local avail
+    while :; do
+      sleep 2
+
+      # Parent script disappeared: terminate quietly.
+      kill -0 "$me" 2>/dev/null || exit 0
+
+      avail="$(df -B1 -- "$dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+      avail="${avail:-0}"
+
+      if (( avail < thr )); then
+        # First watchdog to fire wins. Preserve its diagnostic information.
+        if [[ ! -f "$flag" ]]; then
+          printf '%s\n' \
+            "label=$label" \
+            "dir=$dir" \
+            "free_bytes=$avail" \
+            "threshold_bytes=$thr" \
+            > "$flag"
+        fi
+
+        warn "Space watchdog [$label]: only $(numfmt --to=iec "$avail") left on $dir — stopping the copy before ENOSPC."
+        exit 0
+      fi
+    done
+  ) >/dev/null &
+
+  wd_pid=$!
+  echo "$wd_pid"
+}
+
+# Kill a process and ALL its descendants (pty children included)
+kill_tree() {
+  local pid="$1" sig="${2:-INT}" c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$c" "$sig"; done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
 spinner() {
   local pid=$1
   local msg="${2:-Working}"
@@ -650,10 +842,20 @@ spinner() {
 run_with_spinner() {
   local msg="$1"
   shift
+  local prev_trap
+  prev_trap="$(trap -p INT TERM HUP)"
   "$@" &
   local pid=$!
+  trap 'kill_tree "$pid" INT 2>/dev/null' INT TERM HUP
   spinner "$pid" "$msg"
   wait "$pid"
+  local rc=$?
+  if [[ -n "$prev_trap" ]]; then
+    eval "$prev_trap"
+  else
+    trap 'exit 130' INT TERM HUP
+  fi
+  return $rc
 }
 
 qemu_img_convert_with_tty_progress() {
@@ -679,7 +881,7 @@ qemu_img_convert_with_tty_progress() {
   if [[ "$rc" -eq 130 ]]; then
     echo >&2
     warn "$label cancelled."
-    return 0
+    return 130
   fi
 
   return "$rc"
@@ -695,9 +897,9 @@ pick_block_device() {
     lsblk -nrpo NAME,TYPE,SIZE,MODEL,SERIAL,MOUNTPOINTS | sed 's/\\x20/ /g' |
       awk -v w="$want" '
         $2==w {
-          if ($1 ~ "^/dev/nbd[0-9]+") next
-          if ($1 ~ "^/dev/loop[0-9]+") next
+          if ($1 ~ "^/dev/(nbd|loop|nullb|zram|ram)[0-9]*") next
           if ($2 == "rom") next
+          if ($3 ~ /^0(\.0+)?[BKMGTPEZ]?$/) next   # empty card readers / no medium
           print
         }'
   )
@@ -722,6 +924,18 @@ pick_block_device() {
   echo "${lines[$((sel-1))]}" | awk '{print $1}'
 }
 
+# ── Read-only mount with journal-safe fallbacks (dirty journals, xfs/btrfs) ──
+mount_ro_fs() {   # $1=device $2=mountpoint $3=quiet(true|false, default false)
+  local dev="$1" mp="$2" quiet="${3:-false}"
+  mount -o ro "$dev" "$mp" 2>/dev/null && return 0
+  mount -t ext4 -o ro,noload "$dev" "$mp" 2>/dev/null && return 0
+  if [[ "$quiet" == "true" ]]; then
+    mount -o ro,norecovery "$dev" "$mp" 2>/dev/null
+  else
+    mount -o ro,norecovery "$dev" "$mp"
+  fi
+}
+
 is_mounted() {
   local dev="$1"
   findmnt -rn --source "$dev" >/dev/null 2>&1
@@ -729,8 +943,8 @@ is_mounted() {
 
 maybe_unmount() {
   local dev="$1"
+  local targets="" ans line p t
 
-  local targets=""
   targets="$(findmnt -rn -o TARGET -S "$dev" 2>/dev/null || true)"
 
   if [[ "$(lsblk -no TYPE "$dev" 2>/dev/null || true)" == "disk" ]]; then
@@ -749,16 +963,30 @@ maybe_unmount() {
     read -rp "🧨 Unmount ALL related mounts now? (y/N): " ans <"$TTY"
 
     if [[ "${ans,,}" == "y" ]]; then
+      local unmount_failed=0
       while IFS= read -r t; do
         if [[ -n "$t" ]]; then
-          umount "$t" 2>/dev/null || true
+          if ! umount "$t" 2>/dev/null; then
+            # Check if it's actually still mounted (might have been already unmounted)
+            if mountpoint -q "$t" 2>/dev/null || findmnt -rn --target "$t" >/dev/null 2>&1; then
+              warn "Failed to unmount: $t (device busy?)"
+              unmount_failed=1
+            fi
+          fi
         fi
       done < <(echo "$targets" | awk '{print length "\t" $0}' | sort -nr | cut -f2-)
-      log "Unmount attempted ✅"
+      
+      if (( unmount_failed )); then
+        warn "Cannot proceed: some mounts could not be released."
+        return 1
+      fi
+      log "Unmount successful ✅"
     else
-      die "Refusing to image/overwrite a mounted device."
+      warn "Refusing to touch a mounted device. Operation cancelled."
+      return 1
     fi
   fi
+  return 0
 }
 
 # --------- GUI (zenity) ---------
@@ -833,17 +1061,13 @@ detect_disk_info() {
     echo "   📋 Partition Table: None detected (raw filesystem?)" >&2
   fi
 
-  local parts
-  parts="$(lsblk -nrpo NAME,SIZE,FSTYPE,PARTTYPENAME "$dev" 2>/dev/null | tail -n +2)"
-  if [[ -n "$parts" ]]; then
-    echo "   📦 Partitions:" >&2
-    while IFS= read -r line; do
-      echo "      $line" >&2
-    done <<< "$parts"
+  # Single merged view: tree + partition type names + mountpoints
+  lsblk -o NAME,TYPE,SIZE,FSTYPE,PARTTYPENAME,MOUNTPOINTS "$dev" >&2 || true
 
-    if echo "$parts" | grep -qi "vfat"; then
-      echo "   🔎 UEFI hint: FAT partition detected (possible EFI System Partition)" >&2
-    fi
+  local parts
+  parts="$(lsblk -nrpo NAME,FSTYPE "$dev" 2>/dev/null | tail -n +2)"
+  if [[ -n "$parts" ]] && echo "$parts" | grep -qi "vfat"; then
+    echo "   🔎 UEFI hint: FAT partition detected (possible EFI System Partition)" >&2
   fi
   echo >&2
 }
@@ -851,6 +1075,15 @@ detect_disk_info() {
 verify_image() {
   local img="$1"
   [[ -f "$img" ]] || return 0
+
+  local fmt
+  fmt="$(detect_img_format "$img")"
+  
+  # Raw and some other formats don't support integrity checks
+  if [[ "$fmt" == "raw" || "$fmt" == "vmdk" || "$fmt" == "vpc" || "$fmt" == "vhdx" ]]; then
+    info "Image format $fmt does not support integrity checks (skipped)."
+    return 0
+  fi
 
   log "🔍 Verifying image integrity…"
   local check_output
@@ -932,9 +1165,10 @@ ask_path_existing_file() {
   local p=""
 
   if has_gui; then
+    info "Opening file picker to select source image…"
     p="$(gui_pick_file "Select a disk image" "*.qcow2 *.img *.raw *.vmdk *.vhdx *.vhd")"
     if [[ -z "$p" ]]; then
-      warn "GUI cancelled. Falling back to terminal input."
+      warn "GUI cancelled. Falling back to terminal input." >&2
     elif [[ -f "$p" ]] && is_qemu_image "$p"; then
       printf "%s\n" "$p"
       return
@@ -966,7 +1200,7 @@ ask_path_existing_file() {
 
 ask_path_new_file() {
   local prompt="$1"
-  local p=""
+  local p="" ans=""
   while true; do
     read -rp "$prompt" p <"$TTY"
     [[ -n "$p" ]] || { warn "Empty path not allowed."; continue; }
@@ -1042,7 +1276,7 @@ ask_format_out() {
 ask_yesno() {
   local prompt="$1"
   local def="${2:-N}"
-  local ans
+  local ans=""
 
   while true; do
     read -rp "$prompt (${def}/$( [[ "${def^^}" == "Y" ]] && echo "n" || echo "y" )): " ans <"$TTY"
@@ -1056,25 +1290,116 @@ ask_yesno() {
   done
 }
 
-run_convert() {
-  local in_fmt="$1"
-  local src="$2"
-  local out_fmt="$3"
-  local dst="$4"
+# ── Canonical convert wrapper: pty + total + env hygiene ──
+run_convert_engine() {
+  local src_fmt="$1" src="$2" dst_fmt="$3" dst="$4"
   shift 4
-  local extra_opts=("$@")
+  local total=0
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && { total="$1"; shift; }   # optional explicit total
+  local -a extra=("$@")
 
-  local cmd=(qemu-img convert -p -f "$in_fmt" -O "$out_fmt")
-  if ((${#extra_opts[@]} > 0)); then
-    cmd+=("${extra_opts[@]}")
-  fi
+  # Progress total = bytes qemu-img will READ (device size / virtual size)
+  (( total > 0 )) || total="$(get_total_bytes "$src" 2>/dev/null || echo 0)"
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+
+  local -a cmd=(qemu-img convert -p -f "$src_fmt" -O "$dst_fmt")
+  ((${#extra[@]} > 0)) && cmd+=("${extra[@]}")
   cmd+=("$src" "$dst")
 
-  run_with_progress_bar "Converting $src → $dst" "${cmd[@]}"
+  # qemu-img -p prints progress ONLY on a TTY → run inside a pty so the
+  # engine's log parser receives (NN.NN/100%) lines
+  local cmd_str
+  cmd_str="$(printf '%q ' "${cmd[@]}")"
+
+  PB_TOTAL="$total"
+  PB_HEADER="$src → $dst"              # full paths in the header line
+  [[ -b "$src" ]] && PB_SRC="$src"     # real-time kernel READ counters
+
+  # Detail subline: drive model · size · output format/compression
+  local comp="" model="" sub=""
+  [[ " ${extra[*]} " == *" -c "* ]] && comp="compressed"
+  [[ " ${extra[*]} " == *"compression_type=zstd"* ]] && comp="zstd-compressed"
+  if [[ -b "$src" ]]; then
+    model="$(lsblk -no MODEL "$src" 2>/dev/null | head -n1)"
+    model="${model#"${model%%[![:space:]]*}"}"; model="${model%"${model##*[![:space:]]}"}"
+    _pb_human "$total"
+    sub="${model:-disk} · $PB_H · $dst_fmt${comp:+ ($comp)}"
+  else
+    sub="$dst_fmt${comp:+ ($comp)}"
+  fi
+  PB_SUBLINE="$sub"
+
+  run_with_progress_bar "Converting $src → $dst" "$total" \
+    script -q -f -e -c "$cmd_str" /dev/null
+  local rc=$?
+  unset PB_TOTAL PB_HEADER PB_SRC PB_SUBLINE
+  return $rc
 }
 
+# ── Canonical clone wrapper: kernel WRITE counters on target + 3-line header ──
+run_clone_engine() {   # $1=src $2=target $3=total $4=use_pv(true|false)
+  local src="$1" target="$2" total="$3" usepv="${4:-false}"
+  local -a cmd
+  if [[ "$usepv" == "true" ]]; then
+    local sh_cmd
+    sh_cmd="$(printf 'pv -s %q -N Cloning %q > %q' "$total" "$src" "$target")"
+    cmd=(bash -c "$sh_cmd")
+    log "Using pv for block-level copy…"
+  else
+    cmd=(qemu-img convert -p -f raw -O raw "$src" "$target")
+  fi
+
+  local smodel tmodel
+  smodel="$(lsblk -no MODEL "$src" 2>/dev/null | head -n1)"
+  smodel="${smodel#"${smodel%%[![:space:]]*}"}"; smodel="${smodel%"${smodel##*[![:space:]]}"}"
+  tmodel="$(lsblk -no MODEL "$target" 2>/dev/null | head -n1)"
+  tmodel="${tmodel#"${tmodel%%[![:space:]]*}"}"; tmodel="${tmodel%"${tmodel##*[![:space:]]}"}"
+  _pb_human "$total"
+
+  PB_EMOJI="📀"
+  PB_DEV="$target"
+  PB_TOTAL="$total"
+  PB_HEADER="$src → $target"
+  PB_SUBLINE="${smodel:-disk} ($PB_H) → ${tmodel:-disk}"
+  run_with_progress_bar "Cloning $src → $target…" "$total" "${cmd[@]}"
+  local rc=$?
+  unset PB_EMOJI PB_DEV PB_TOTAL PB_HEADER PB_SUBLINE
+  return $rc
+}
+
+# ── Canonical device-write wrapper: kernel counters + 3-line header ──
+run_write_engine() {   # $1=img $2=target $3=total_bytes $4=compressed(true|false)
+  local img="$1" target="$2" total="$3" compressed="${4:-false}"
+  local -a cmd=(qemu-img convert -p)
+  if [[ "$compressed" == "true" ]]; then
+    cmd+=(-m 1)
+    log "Compressed image detected — using low-memory mode (-m 1)"
+  fi
+  cmd+=(-O raw "$img" "$target")
+
+  local fmt model tgt_size
+  fmt="$(detect_img_format "$img")"
+  model="$(lsblk -no MODEL "$target" 2>/dev/null | head -n1)"
+  model="${model#"${model%%[![:space:]]*}"}"; model="${model%"${model##*[![:space:]]}"}"
+  tgt_size="$(bytes_of_src "$target" 2>/dev/null || echo 0)"
+  _pb_human "$tgt_size"
+
+  PB_EMOJI="🧨"
+  PB_DEV="$target"
+  PB_TOTAL="$total"
+  PB_HEADER="$(basename "$img") → $target"
+  PB_SUBLINE="$fmt${compressed:+ (compressed)} · $(numfmt --to=iec "$total") → ${model:-disk} · $PB_H"
+  run_with_progress_bar "Writing (image → raw → device)…" "$total" "${cmd[@]}"
+  local rc=$?
+  unset PB_EMOJI PB_DEV PB_TOTAL PB_HEADER PB_SUBLINE
+  return $rc
+}
+
+# Legacy alias (same arg order: in_fmt src out_fmt dst [total] [extra...])
+run_convert() { run_convert_engine "$@"; }
+
 pick_free_nbd() {
-  check_nbd_module >&2 || exit 1
+  check_nbd_module >&2 || return 1
 
   udevadm settle 2>/dev/null || true
 
@@ -1087,7 +1412,7 @@ pick_free_nbd() {
     idx="${dev#/dev/nbd}"
     size="$(cat "/sys/block/nbd${idx}/size" 2>/dev/null || echo 0)"
 
-    if [[ "${size:-0}" == "0" ]]; then
+    if [[ "${size:-0}" == "0" ]] && ! _nbd_owned_by_other "$idx"; then
       printf '%s\n' "$dev"
       return 0
     fi
@@ -1100,14 +1425,14 @@ pick_free_nbd() {
 
 pick_partition_from_device() {
   local disk="$1"
-  [[ -b "$disk" ]] || die "Not a block device: $disk"
+  [[ -b "$disk" ]] || { warn "Not a block device: $disk"; return 1; }
 
   local parts=()
   while IFS= read -r p; do
     [[ -b "$p" ]] && parts+=("$p")
   done < <(lsblk -nrpo NAME,TYPE "$disk" | awk '$2=="part"{print $1}')
 
-  ((${#parts[@]} == 0)) && die "No partitions found on: $disk"
+  ((${#parts[@]} == 0)) && { warn "No partitions found on: $disk"; return 1; }
 
   {
     echo "🧩 Select a partition to mount:"
@@ -1140,21 +1465,33 @@ pick_partition_from_device() {
 global_cleanup() {
   set +e
 
+  # Run registered cleanup hooks (LIFO)
+  for ((i=${#CLEANUP_HOOKS[@]}-1; i>=0; i--)); do
+    "${CLEANUP_HOOKS[$i]}" 2>/dev/null || true
+  done
+  CLEANUP_HOOKS=()
+
+  # Disconnect all used nbd devices
   for d in "${USED_NBDS[@]}"; do
     [[ "$d" =~ ^/dev/nbd[0-9]+$ ]] || continue
+    _nbd_unstamp "$d"
 
     local idx sz
     idx="${d#/dev/nbd}"
     sz="$(cat "/sys/block/nbd${idx}/size" 2>/dev/null || echo 0)"
 
+    # Only disconnect if it still looks connected
     [[ "${sz:-0}" != "0" ]] || continue
     qemu-nbd --disconnect "$d" >/dev/null 2>&1 || true
   done
 
+  # Clear the USED_NBDS array
   USED_NBDS=()
 
+  # Wait for disconnects to settle
   sleep 0.5
 
+  # Check if ANY nbd device is still in use
   local any_in_use=0
   for dev in /sys/block/nbd*; do
     [[ -d "$dev" ]] || continue
@@ -1166,48 +1503,61 @@ global_cleanup() {
     fi
   done
 
-  if [[ "$any_in_use" -eq 0 ]]; then
-    modprobe -r nbd 2>/dev/null || true
+  # Unload ONLY if WE loaded it AND nobody (any terminal) is using it
+  if [[ "$any_in_use" -eq 0 && "${NBD_LOADED_BY_US:-0}" -eq 1 ]]; then
+    timeout 5 modprobe -r nbd 2>/dev/null || true   # never block exit on a stuck module
     NBD_LOADED_BY_US=0
   fi
 }
 
+# ── Register global cleanup traps ──
+trap global_cleanup EXIT
+trap 'exit 130' INT TERM HUP   # HUP = terminal closed → still clean up
+
+
+
 write_image_metadata() {
   local img="$1"
   local src="${2:-unknown}"
-  local notes="${3:-}"
+  local notes="${3:-No additional notes}"
   
   local info_file="${img}.info"
-  local fmt vsize dsize
+  local fmt vsize dsize hostname_str user_str gen_time
+  local part_info
+  
   fmt="$(detect_img_format "$img" 2>/dev/null || echo "unknown")"
   vsize="$(qemu-img info "$img" 2>/dev/null | awk -F': ' '/^virtual size:/ {print $2; exit}')"
   dsize="$(stat -c '%s' "$img" 2>/dev/null || echo "0")"
+  hostname_str="$(hostname 2>/dev/null || echo "unknown")"
+  user_str="${SUDO_USER:-$USER}"
+  gen_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   
-  cat > "$info_file" 2>/dev/null <<METAEOF
+  if [[ -b "$src" ]]; then
+    part_info="$(lsblk -nrpo NAME,SIZE,FSTYPE "$src" 2>/dev/null | head -20 || echo "  (unable to read partition info)")"
+  else
+    part_info="  (source is not a block device)"
+  fi
+  
+  # Safe: quoted heredoc prevents command injection
+  cat > "$info_file" 2>/dev/null <<'METAEOF'
 # QEMU Disk Tool — Image Metadata
-# Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')
-
-[Image]
-File: $(basename "$img")
-Format: ${fmt}
-Virtual_Size: ${vsize:-unknown}
-Disk_Size_Bytes: ${dsize}
-
-[Source]
-Device: ${src}
-Hostname: $(hostname 2>/dev/null || echo "unknown")
-User: ${SUDO_USER:-$USER}
-
-[Partition_Info]
-$(if [[ -b "$src" ]]; then
-  lsblk -nrpo NAME,SIZE,FSTYPE "$src" 2>/dev/null | head -20 || echo "  (unable to read partition info)"
-else
-  echo "  (source is not a block device)"
-fi)
-
-[Notes]
-${notes:-No additional notes}
 METAEOF
+  
+  # Append dynamic content safely using printf
+  {
+    printf '# Generated: %s\n\n' "$gen_time"
+    printf '[Image]\n'
+    printf 'File: %s\n' "$(basename "$img")"
+    printf 'Format: %s\n' "${fmt:-unknown}"
+    printf 'Virtual_Size: %s\n' "${vsize:-unknown}"
+    printf 'Disk_Size_Bytes: %s\n' "$dsize"
+    printf '\n[Source]\n'
+    printf 'Device: %s\n' "$src"
+    printf 'Hostname: %s\n' "$hostname_str"
+    printf 'User: %s\n' "$user_str"
+    printf '\n[Partition_Info]\n%s\n' "$part_info"
+    printf '\n[Notes]\n%s\n' "$notes"
+  } >> "$info_file" 2>/dev/null
 
   if [[ -f "$info_file" ]]; then
     log "📝 Metadata saved: $info_file"
@@ -1272,3 +1622,726 @@ pv_copy_with_progress() {
     dd if="$src" of="$dst" bs=4M status=progress 2>&1
   fi
 }
+
+# ============================================================
+# NEW PHASE 1 HELPERS (Appended safely)
+# ============================================================
+
+# ── Neutral cancel (info + return 1, NOT die) ──
+user_cancel() { info "${1:-Cancelled.}"; return 1; }
+
+# ── Hook registry ──
+register_cleanup() { CLEANUP_HOOKS+=("$1"); }
+cleanup_unregister() {
+  local fn="$1" tmp=()
+  for x in "${CLEANUP_HOOKS[@]}"; do [[ "$x" != "$fn" ]] && tmp+=("$x"); done
+  CLEANUP_HOOKS=("${tmp[@]}")
+}
+
+# ── Typed confirmation with retry + optional cancel keywords ──
+confirm_typed() {
+  local word="$1" prompt="${2:-Type $word to confirm:}" allow_empty="${3:-false}"
+  local ans
+  while true; do
+    read -rp "✍️  $prompt " ans <"$TTY"
+    if [[ "$ans" == "$word" ]]; then return 0; fi
+    if [[ "$allow_empty" == "true" && -z "$ans" ]]; then user_cancel "Aborted (empty input)."; return 1; fi
+    case "${ans,,}" in cancel|q|quit|c|abort) user_cancel "Aborted by user."; return 1 ;; esac
+    warn "Mismatch! Please type exactly: $word"
+  done
+}
+
+# ── Format → extension ──
+fmt_to_ext() {
+  case "$1" in
+    qcow2) echo "qcow2" ;; raw) echo "img" ;; vmdk) echo "vmdk" ;;
+    vhdx) echo "vhdx" ;; vpc|vhd) echo "vhd" ;; *) echo "img" ;;
+  esac
+}
+
+# ── Bounded size input ──
+ask_size() {
+  local prompt="${1:-📏 Size (e.g., 20G)}" min="${2:-1048576}" max="${3:-70368744177664}"
+  local size bytes
+  while true; do
+    read -rp "$prompt: " size <"$TTY"
+    [[ -n "$size" ]] || { warn "Size cannot be empty."; continue; }
+    [[ "$size" =~ ^[0-9]+[bBkKmMgGtTpPeE]?$ ]] || { warn "Invalid format. Use number + K/M/G/T."; continue; }
+    bytes="$(numfmt --from=auto "$size" 2>/dev/null)" || { warn "Could not parse size."; continue; }
+    (( bytes < min )) && { warn "Too small (min $(numfmt --to=iec "$min"))."; continue; }
+    (( bytes > max )) && { warn "Too large (max $(numfmt --to=iec "$max"))."; continue; }
+    echo "$size"; return
+  done
+}
+
+# ── Free-space check ──
+check_free_space() {
+  local dir="$1" need="$2"
+  local avail; avail="$(df -B1 "$dir" 2>/dev/null | awk 'NR==2 {print $4}')"
+  avail="${avail:-0}"
+  (( avail >= need )) || {
+    err "Not enough space in $dir"; echo "   Need:      $(numfmt --to=iec "$need")"; echo "   Available: $(numfmt --to=iec "$avail")"; return 1
+  }; return 0
+}
+
+# ── Save path with GUI fallback, auto-ext, dir/overwrite/space checks ──
+# $4 = protected_path (e.g., source file) which MUST NOT be overwritten.
+ask_save_path() {
+  local default_path="$1" ext="${2:-}" est_bytes="${3:-0}" protected_path="${4:-}" defer_existing="${5:-false}"
+  local remembered_path="$default_path" try_gui=true dst="" tmp outdir parent_dir
+  outdir="$(dirname "$default_path")"
+
+  while true; do
+    dst=""
+    if [[ "$try_gui" == "true" ]] && has_gui; then
+      local gui_path
+      info "Opening file picker to choose save location…"
+      gui_path="$(gui_pick_save_file "Save as" "$remembered_path" || true)"
+      if [[ -n "$gui_path" ]]; then dst="$gui_path"
+      else info "GUI cancelled. Falling back to terminal input." >&2; fi
+      try_gui=false
+    fi
+    if [[ -z "$dst" ]]; then
+      echo >&2
+      echo "   📁 Current path: $remembered_path" >&2
+      if has_gui; then echo "   💡 Type a path, 'gui' for picker, or 'cancel' to abort." >&2
+      else echo "   💡 Type a path or 'cancel' to abort." >&2; fi
+      read -rp "   ➡️  Save as: " tmp <"$TTY" || { user_cancel >&2; return 1; }
+      case "${tmp,,}" in
+        cancel|q|quit|abort) user_cancel >&2; return 1 ;;
+        gui)  try_gui=true; continue ;;
+        "")   dst="$remembered_path" ;;
+        */*)  dst="$tmp" ;;
+        *)    dst="$outdir/$tmp" ;;
+      esac
+    fi
+    [[ -n "$ext" && "$dst" != *".$ext" ]] && dst="${dst}.${ext}"
+    remembered_path="$dst"
+
+    parent_dir="$(dirname "$dst")"
+    [[ -d "$parent_dir" ]] || { warn "Directory not found: $parent_dir" >&2; continue; }
+
+    if [[ -e "$dst" && "$defer_existing" != "true" ]]; then
+      # Guard against overwriting a protected file (e.g., the source image)
+      if [[ -n "$protected_path" ]]; then
+        local dst_real prot_real
+        dst_real="$(realpath -m "$dst" 2>/dev/null || echo "$dst")"
+        prot_real="$(realpath -m "$protected_path" 2>/dev/null || echo "$protected_path")"
+        if [[ "$dst_real" == "$prot_real" ]]; then
+          err "Refusing to overwrite the protected source file: $protected_path" >&2
+          continue
+        fi
+      fi
+
+      warn "File exists: $dst" >&2
+      local ow; ow="$(ask_yesno "Overwrite it?" "N")"
+      [[ "$ow" == "true" ]] || continue
+      rm -f "$dst"
+    fi
+
+    (( est_bytes > 0 )) && { check_free_space "$parent_dir" "$est_bytes" >&2 || continue; }
+
+    success "Output confirmed: $dst" >&2
+    echo "$dst"          # ← the ONLY stdout output
+    return 0
+  done
+}
+
+# ── Build the EXACT rsync exclude list used by Option 10 ──
+# $1 = boot_part
+# $2 = source_is_live (0|1)
+# $3 = nameref receiving the array
+_migration_build_rsync_excludes() {
+  local boot_part="$1"
+  local src_is_live="$2"
+  local -n _out="$3"
+
+  _out=(
+    --exclude='/proc/*'
+    --exclude='/sys/*'
+    --exclude='/dev/*'
+    --exclude='/run/*'
+    --exclude='/tmp/*'
+    --exclude='/mnt/*'
+    --exclude='/media/*'
+    --exclude='/lost+found'
+    --exclude='/.migration-src-id'
+  )
+
+  [[ -n "$boot_part" ]] && _out+=(--exclude='/boot/efi/*')
+
+  # These are LIVE-source exclusions only. Do not duplicate them in the
+  # base list; the same helper is used by dry-run, resume probe, and copy.
+  if (( src_is_live )); then
+    _out+=(
+      --exclude='/var/log/journal/*'
+      --exclude='/var/cache/*'
+      --exclude='/var/tmp/*'
+      --exclude='/var/crash/*'
+      --exclude='/var/spool/abrt/*'
+      --exclude='/home/*/.cache/*'
+      --exclude='/root/.cache/*'
+    )
+  fi
+}
+
+# ── Measure the actual rsync transfer set before creating a fresh image ──
+# Prints ONLY the measured transfer bytes on stdout.
+# Returns 1 if the measurement cannot be obtained.
+_migration_measure_transfer() {
+  local root_part="$1"
+  local boot_part="$2"
+  local src_is_live="$3"
+
+  local src_mp src_here=0
+  local used_bytes=""
+
+  src_mp="$(findmnt -rn -o TARGET -S "$root_part" 2>/dev/null | head -n1)"
+
+  if [[ -z "$src_mp" ]]; then
+    src_mp="$(mktemp -d)" || return 1
+
+    if ! mount_ro_fs "$root_part" "$src_mp" true; then
+      rmdir "$src_mp" 2>/dev/null || true
+      return 1
+    fi
+
+    src_here=1
+  fi
+
+  # Measure ACTUAL allocated filesystem space, not logical file size.
+  # This is important for sparse VM images, databases, containers, etc.
+  #
+  # We cd into $src_mp in a subshell so du --exclude patterns match correctly
+  # against relative paths (./proc instead of /tmp/tmp.xxx/proc).
+  # -x prevents traversal into separately mounted filesystems.
+  local -a du_ex=(
+    --exclude='./proc'
+    --exclude='./sys'
+    --exclude='./dev'
+    --exclude='./run'
+    --exclude='./tmp'
+    --exclude='./mnt'
+    --exclude='./media'
+    --exclude='./lost+found'
+    --exclude='./.migration-src-id'
+  )
+
+  [[ -n "$boot_part" ]] && \
+    du_ex+=(--exclude='./boot/efi')
+
+  if (( src_is_live )); then
+    du_ex+=(
+      --exclude='./var/log/journal'
+      --exclude='./var/cache'
+      --exclude='./var/tmp'
+      --exclude='./var/crash'
+      --exclude='./var/spool/abrt'
+      --exclude='./home/*/.cache'
+      --exclude='./root/.cache'
+    )
+  fi
+
+  used_bytes="$(
+    (
+      cd "$src_mp" 2>/dev/null || exit 1
+      du -sx -B1 \
+        "${du_ex[@]}" \
+        . 2>/dev/null |
+        awk 'NR==1 {print $1}'
+    )
+  )"
+
+  if [[ ! "$used_bytes" =~ ^[0-9]+$ ]]; then
+    if (( src_here )); then
+      umount "$src_mp" 2>/dev/null || true
+      rmdir "$src_mp" 2>/dev/null || true
+    fi
+
+    warn "Could not measure allocated source space safely."
+    return 1
+  fi
+
+  if (( src_here )); then
+    umount "$src_mp" 2>/dev/null || true
+    rmdir "$src_mp" 2>/dev/null || true
+  fi
+
+  printf '%s\n' "$used_bytes"
+}
+
+# ── Probe an existing qcow2 for resumability ──
+# Returns 0 if resumable; prints reason to stderr on refusal.
+# Args: $1=image path, $2=source disk (for marker check), $3=boot_part (empty=BIOS), $4=root_part
+_migration_can_resume() {
+  local img="$1" src_disk="$2" boot_part="$3" root_part="$4"
+  _MIG_RESUME_DELTA=0
+
+  [[ -f "$img" ]] || return 1
+
+  local fmt
+  fmt="$(
+    LC_ALL=C qemu-img info "$img" 2>/dev/null |
+      sed -n 's/^file format: //p' |
+      head -n1
+  )"
+
+  [[ "$fmt" == "qcow2" ]] || return 1
+
+  local nbd="" probe_root="" probe_mp="" probe_src_mp="" src_here=0
+  local src_tmp="" src_is_live=0
+  local src_serial="" marker=""
+  local dry_out="" dry_need="" dry_created=""
+  local target_free="" target_ifree=""
+  local dry_rc=0 verdict=1
+
+  if ! nbd="$(nbd_attach "$img" true 2>/dev/null)"; then
+    return 1
+  fi
+
+  if [[ -n "$boot_part" ]]; then
+    local probe_efi="${nbd}p1"
+    probe_root="${nbd}p2"
+
+    if [[ ! -b "$probe_efi" || ! -b "$probe_root" ]]; then
+      nbd_release "$nbd" 2>/dev/null || true
+      return 1
+    fi
+  else
+    probe_root="${nbd}p1"
+
+    if [[ ! -b "$probe_root" || -b "${nbd}p2" ]]; then
+      nbd_release "$nbd" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  if ! e2fsck -fn "$probe_root" >/dev/null 2>&1; then
+    nbd_release "$nbd" 2>/dev/null || true
+    return 1
+  fi
+
+  probe_mp="$(mktemp -d)" || {
+    nbd_release "$nbd" 2>/dev/null || true
+    return 1
+  }
+
+  if ! mount -o ro "$probe_root" "$probe_mp" 2>/dev/null; then
+    rmdir "$probe_mp" 2>/dev/null || true
+    nbd_release "$nbd" 2>/dev/null || true
+    return 1
+  fi
+
+  if [[ ! -f "$probe_mp/etc/fstab" ]]; then
+    umount "$probe_mp" 2>/dev/null || true
+    rmdir "$probe_mp" 2>/dev/null || true
+    nbd_release "$nbd" 2>/dev/null || true
+    return 1
+  fi
+
+  src_serial="$(
+    lsblk -no SERIAL "$src_disk" 2>/dev/null |
+      head -n1 |
+      tr -d ' '
+  )"
+
+  if [[ -s "$probe_mp/.migration-src-id" && -n "$src_serial" ]]; then
+    marker="$(
+      tr -d '\r\n' < "$probe_mp/.migration-src-id" 2>/dev/null || true
+    )"
+
+    if [[ "$marker" != "$src_serial" ]]; then
+      umount "$probe_mp" 2>/dev/null || true
+      rmdir "$probe_mp" 2>/dev/null || true
+      nbd_release "$nbd" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  probe_src_mp="$(
+    findmnt -rn -o TARGET -S "$root_part" 2>/dev/null |
+      head -n1
+  )"
+
+  if [[ -n "$probe_src_mp" ]]; then
+    src_is_live=1
+  else
+    src_tmp="$(mktemp -d)" || {
+      umount "$probe_mp" 2>/dev/null || true
+      rmdir "$probe_mp" 2>/dev/null || true
+      nbd_release "$nbd" 2>/dev/null || true
+      return 1
+    }
+
+    probe_src_mp="$src_tmp"
+
+    if ! mount_ro_fs "$root_part" "$probe_src_mp" true; then
+      rmdir "$src_tmp" 2>/dev/null || true
+      umount "$probe_mp" 2>/dev/null || true
+      rmdir "$probe_mp" 2>/dev/null || true
+      nbd_release "$nbd" 2>/dev/null || true
+      return 1
+    fi
+
+    src_here=1
+  fi
+
+  local -a rs_ex=()
+  _migration_build_rsync_excludes "$boot_part" "$src_is_live" rs_ex
+
+  if dry_out="$(
+    LC_ALL=C rsync -aHAXSx --numeric-ids --dry-run --stats \
+      "${rs_ex[@]}" \
+      "$probe_src_mp/" "$probe_mp/" 2>&1
+  )"; then
+    dry_rc=0
+  else
+    dry_rc=$?
+  fi
+
+  dry_need="$(
+    sed -n \
+      's/^Total transferred file size: *\([0-9,]*\) bytes.*/\1/p' \
+      <<<"$dry_out" |
+      tr -d ',' |
+      head -n1
+  )"
+
+  dry_created="$(
+    sed -n \
+      's/^Number of created files: *\([0-9,]*\).*/\1/p' \
+      <<<"$dry_out" |
+      tr -d ',' |
+      head -n1
+  )"
+
+  target_free="$(
+    df -B1 "$probe_mp" 2>/dev/null |
+      awk 'NR==2 {print $4}'
+  )"
+
+  target_ifree="$(
+    df -Pi "$probe_mp" 2>/dev/null |
+      awk 'NR==2 {print $4}'
+  )"
+
+  target_free="${target_free:-0}"
+  target_ifree="${target_ifree:-0}"
+
+  if [[ "$dry_need" =~ ^[0-9]+$ &&
+        "$target_free" =~ ^[0-9]+$ ]]; then
+
+    local byte_need=$(( dry_need + 256*1024*1024 ))
+
+    if (( target_free >= byte_need )); then
+      if [[ "$target_ifree" =~ ^[0-9]+$ &&
+            "$target_ifree" -gt 0 ]]; then
+
+        if [[ "$dry_created" =~ ^[0-9]+$ ]]; then
+          local inode_need=$(( dry_created + dry_created/20 + 1024 ))
+
+          if (( target_ifree >= inode_need )); then
+            verdict=0
+            _MIG_RESUME_DELTA="$dry_need"    # global: caller reads this AFTER the function returns
+          fi
+        else
+          verdict=0
+          _MIG_RESUME_DELTA="$dry_need"
+          warn "Resume probe could not parse rsync's created-file count; byte/inode zero checks passed."
+        fi
+      fi
+    fi
+  fi
+
+  if (( dry_rc != 0 )) && [[ "$dry_need" =~ ^[0-9]+$ ]]; then
+    warn "Resume rsync dry-run returned exit $dry_rc, but produced usable statistics."
+  fi
+
+  if (( src_here )); then
+    umount "$probe_src_mp" 2>/dev/null || true
+    rmdir "$probe_src_mp" 2>/dev/null || true
+  fi
+
+  umount "$probe_mp" 2>/dev/null || true
+  rmdir "$probe_mp" 2>/dev/null || true
+
+  nbd_release "$nbd" 2>/dev/null || true
+
+  if (( verdict != 0 )); then
+    _MIG_RESUME_DELTA=0
+    return 1
+  fi
+
+  return 0
+}
+
+# ── Smart size estimation ──
+estimate_image_size() {
+  local src="$1" fmt="${2:-qcow2}" compressed="${3:-false}"
+  local src_size; src_size="$(bytes_of_src "$src" 2>/dev/null || echo 0)"
+  [[ "$fmt" == "raw" ]] && { echo "$src_size"; return 0; }
+
+  # Build list of filesystems to measure: partitions, or bare device
+  local -a targets=()
+  if [[ -b "$src" && "$(lsblk -no TYPE "$src" 2>/dev/null)" == "part" ]]; then
+    targets=("$src")
+  elif [[ -b "$src" ]]; then
+    while IFS= read -r p; do [[ -b "$p" ]] && targets+=("$p"); done \
+      < <(lsblk -nrpo NAME,TYPE "$src" 2>/dev/null | awk '$2=="part"{print $1}')
+  fi
+  (( ${#targets[@]} == 0 )) && [[ -b "$src" ]] && targets=("$src")
+
+  local used=0 measured=0 counted=0
+  local p fsz pused mnt
+  for p in "${targets[@]}"; do
+    fsz="$(blockdev --getsize64 "$p" 2>/dev/null || echo 0)"
+
+    # 1) already mounted → read df directly
+    if mountpoint -q "$p" 2>/dev/null; then
+      pused="$(df -B1 "$p" 2>/dev/null | awk 'NR==2 {print $3}')"
+      if [[ "$pused" =~ ^[0-9]+$ && "$pused" -gt 0 ]]; then
+        used=$((used + pused)); counted=$((counted + 1)); continue
+      fi
+    fi
+
+    # 2) not mounted → temporary READ-ONLY probe mount
+    mnt="$(mktemp -d)"
+    if mount_ro_fs "$p" "$mnt" true; then
+      pused="$(df -B1 "$mnt" 2>/dev/null | awk 'NR==2 {print $3}')"
+      umount "$mnt" 2>/dev/null || true
+      rmdir "$mnt" 2>/dev/null || true
+      if [[ "$pused" =~ ^[0-9]+$ && "$pused" -gt 0 ]]; then
+        used=$((used + pused)); counted=$((counted + 1)); continue
+      fi
+    else
+      umount "$mnt" 2>/dev/null || true
+      rmdir "$mnt" 2>/dev/null || true
+    fi
+
+    # 3) unmeasurable (swap/LVM/unknown fs) → conservative: count full size
+    used=$((used + fsz)); counted=$((counted + 1))
+  done
+
+  if (( counted > 0 && used > 0 )); then
+    local unit="partition"; (( counted > 1 )) && unit="partitions"
+    echo -e "${CYAN}📊 $src: $(numfmt --to=iec "$used") of actual data found on $counted $unit (+15% overhead)${NC}" >&2
+    echo $(( used * 115 / 100 ))
+  elif [[ "$compressed" == "true" ]]; then
+    warn "Could not measure used space; using compressed-format estimate (40%)." >&2
+    echo $(( src_size * 40 / 100 ))
+  else
+    warn "Could not measure used space; using format estimate (70%)." >&2
+    echo $(( src_size * 70 / 100 ))
+  fi
+}
+
+# ── Per-session nbd slot ownership (safe across parallel terminals) ──
+_nbd_stamp() {
+  local idx="${1#/dev/nbd}"
+  mkdir -p /run/qemu-disk-tool 2>/dev/null || return 0
+  echo "$$ ${TTY:-?} $(date +%s)" > "/run/qemu-disk-tool/nbd${idx}.owner" 2>/dev/null || true
+}
+_nbd_unstamp() {
+  local idx="${1#/dev/nbd}"
+  rm -f "/run/qemu-disk-tool/nbd${idx}.owner" 2>/dev/null || true
+}
+_nbd_owned_by_other() {   # true if a LIVE process (another session) claims this slot
+  local idx="${1#/dev/nbd}" f pid rest
+  f="/run/qemu-disk-tool/nbd${idx}.owner"
+  [[ -f "$f" ]] || return 1
+  read -r pid rest < "$f" 2>/dev/null || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || { rm -f "$f"; return 1; }
+  (( pid == $$ )) && return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+# ── NBD attach + release helpers ──
+nbd_attach() {
+  local img="$1" ro="${2:-false}"
+  local nbd; nbd="$(pick_free_nbd)" || return 1
+  if [[ "$ro" == "true" ]]; then qemu-nbd --read-only --connect="$nbd" "$img" || { err "qemu-nbd connect failed"; return 1; }
+  else qemu-nbd --connect="$nbd" "$img" || { err "qemu-nbd connect failed"; return 1; }; fi
+  # Lost when called via $(…) — such callers MUST also do USED_NBDS+=("$nbd").
+  # Kept as the safety net for bare (non-subshell) call sites.
+  USED_NBDS+=("$nbd")
+  _nbd_stamp "$nbd"
+  log "Using $nbd (session PID $$ — other terminals will skip this slot)"
+  udevadm settle 2>/dev/null || sleep 0.5
+  partprobe "$nbd" 2>/dev/null || true
+  udevadm settle 2>/dev/null || sleep 0.3
+  echo "$nbd"
+}
+nbd_release() {
+  local nbd="$1"; [[ -n "$nbd" && "$nbd" =~ ^/dev/nbd[0-9]+$ ]] || return 0
+  qemu-nbd --disconnect "$nbd" >/dev/null 2>&1 || true
+  _nbd_unstamp "$nbd"
+  local tmp=() x
+  for x in "${USED_NBDS[@]}"; do [[ "$x" != "$nbd" ]] && tmp+=("$x"); done
+  USED_NBDS=("${tmp[@]}")
+}
+
+# ── Emergency nbd release: kill the server so pending writeback errors out fast ──
+# Use ONLY when the image is being discarded (cancel): no flush guaranteed.
+nbd_kill() {
+  local nbd="$1" p
+  [[ -n "$nbd" && "$nbd" =~ ^/dev/nbd[0-9]+$ ]] || return 0
+  for p in $(pgrep -f "qemu-nbd.*--connect=${nbd}([[:space:]]|$)" 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+  _nbd_unstamp "$nbd"
+  local tmp=() x
+  for x in "${USED_NBDS[@]}"; do [[ "$x" != "$nbd" ]] && tmp+=("$x"); done
+  USED_NBDS=("${tmp[@]}")
+}
+
+# Resolve any block device (part/LVM/RAID/mapper) to underlying physical disk(s)
+phys_disks_of() {
+  local dev="${1#/dev/}"
+  local -a stack=("$dev") out=()
+  while (( ${#stack[@]} )); do
+    local cur="${stack[-1]}"; unset 'stack[-1]'
+    local sl="/sys/block/$cur/slaves"
+    if [[ -d "$sl" && -n "$(ls -A "$sl" 2>/dev/null)" ]]; then
+      local s
+      for s in "$sl"/*; do stack+=("$(basename "$s")"); done
+    else
+      local d="$cur" pk
+      pk="$(lsblk -no PKNAME "/dev/$d" 2>/dev/null | head -n1)"
+      [[ -n "$pk" ]] && d="$pk"
+      out+=("$d")
+    fi
+  done
+  printf '%s\n' "${out[@]}" | sort -u
+}
+
+# ── Guard: refuse to write an image onto a filesystem backed by the source device ──
+assert_dst_not_on_src() {   # $1=src block device  $2=dst file path
+  local src="$1" dst="$2" fs_dev
+  fs_dev="$(findmnt -no SOURCE --target "$(dirname "$dst")" 2>/dev/null || true)"
+  [[ -b "$fs_dev" ]] || return 0
+  local -a sd fd shared
+  mapfile -t sd < <(phys_disks_of "$src")
+  mapfile -t fd < <(phys_disks_of "$fs_dev")
+  mapfile -t shared < <(comm -12 <(printf '%s\n' "${sd[@]}") <(printf '%s\n' "${fd[@]}"))
+  if (( ${#shared[@]} )); then
+    err "Refusing: destination sits on the same physical disk(s) being read: ${shared[*]}"
+    warn "Writing an image onto its own source device causes a runaway self-copy loop."
+    return 1
+  fi
+  return 0
+}
+
+# ── Clone-specific overlap guard: part→part on same disk allowed, all real overlap refused ──
+assert_clone_safe() {
+  local src="$1" target="$2"
+  [[ "$src" != "$target" ]] || { err "Source and target are the same device."; return 1; }
+
+  # Containment: either device inside the other (disk → its own partition, etc.)
+  local a b pair
+  for pair in "$src $target" "$target $src"; do
+    a="${pair%% *}"; b="${pair##* }"
+    if lsblk -nrpo NAME "$a" 2>/dev/null | grep -Fqx "$b"; then
+      err "Refusing: $b is contained inside $a."
+      return 1
+    fi
+  done
+
+  # Physical overlap (LVM/RAID/mapper aware)
+  local -a sd td shared
+  mapfile -t sd < <(phys_disks_of "$src")
+  mapfile -t td < <(phys_disks_of "$target")
+  mapfile -t shared < <(comm -12 <(printf '%s\n' "${sd[@]}") <(printf '%s\n' "${td[@]}"))
+  if (( ${#shared[@]} )); then
+    local st tt
+    st="$(lsblk -no TYPE "$src" 2>/dev/null | head -n1)"
+    tt="$(lsblk -no TYPE "$target" 2>/dev/null | head -n1)"
+    if [[ "$st" == "part" && "$tt" == "part" ]]; then
+      warn "Source and target are partitions on the SAME physical disk (${shared[*]})."
+      warn "Allowed, but expect slow speeds (read+write on one disk)."
+    else
+      err "Refusing: source and target overlap on physical disk(s): ${shared[*]}"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# ── Assert two devices don't overlap ──
+assert_disjoint_devices() {
+  local src="$1" target="$2"
+  
+  # Direct equality check
+  [[ "$src" != "$target" ]] || die "Source and target are the same device."
+  
+  # Precise partition check: one is a partition of the other
+  local src_base="${src##*/}" target_base="${target##*/}"
+  # /dev/sda → /dev/sda1  (digit suffix)   or   /dev/nbd0 → /dev/nbd0p1  (p-digit suffix)
+  if [[ "$target_base" == "${src_base}"[0-9]* || "$target_base" == "${src_base}p"[0-9]* ]]; then
+    die "Refusing to operate: $target is a partition of $src."
+  fi
+  if [[ "$src_base" == "${target_base}"[0-9]* || "$src_base" == "${target_base}p"[0-9]* ]]; then
+    die "Refusing to operate: $src is a partition of $target."
+  fi
+  
+  # Parent disk comparison (two partitions on same disk)
+  local src_disk target_disk
+  src_disk="$(lsblk -no PKNAME "$src" 2>/dev/null || true)"
+  target_disk="$(lsblk -no PKNAME "$target" 2>/dev/null || true)"
+  
+  # If both have the same parent disk, they overlap
+  if [[ -n "$src_disk" && -n "$target_disk" && "$src_disk" == "$target_disk" ]]; then
+    die "Refusing to operate: $src and $target are on the same physical disk ($src_disk)."
+  fi
+}
+
+# ── Zero-fill free space on partitions ──
+zero_fill_parts() {
+  local -a parts=("$@")
+  for zp in "${parts[@]}"; do
+    local zmnt; zmnt="$(mktemp -d)"
+    if mount -o rw "$zp" "$zmnt" 2>/dev/null; then
+      log "  Zeroing free space on $zp…"
+      dd if=/dev/zero of="$zmnt/.zero_fill" bs=1M status=progress 2>&1 || true
+      rm -f "$zmnt/.zero_fill"; sync
+      umount "$zmnt" 2>/dev/null || true
+    fi
+    rmdir "$zmnt" 2>/dev/null || true
+  done
+}
+
+# ── Partition table backup ──
+backup_partition_table() {
+  local disk="$1"
+  local backup_path="/tmp/pt_backup_$(basename "$disk")_$(date +%s).sgdisk"
+  if command -v sgdisk >/dev/null 2>&1; then
+    sgdisk -b "$backup_path" "$disk" 2>/dev/null && { echo "$backup_path"; return 0; }
+  fi
+  return 1
+}
+
+# ── Failure hints for device writes ──
+print_write_failure_hints() {
+  local img="$1" target="$2"
+  err "Write failed. Possible causes:"
+  echo "  1. If 'Cannot allocate memory': close apps, increase RAM, or use -m 1"
+  echo "     Manual: qemu-img convert -p -n -m 1 -O raw \"$img\" \"$target\""
+  echo "  2. Check target device health and free space"
+  echo "  3. Verify source: qemu-img check \"$img\""
+}
+
+# ── Standard operation ending ──
+std_ending() {
+  local op="$1" src="$2" dst="$3" start_ts="${4:-$(date +%s)}"
+  
+  # Skip verify on partial images (marked with .incomplete sidecar)
+  if [[ -f "${dst}.incomplete" ]]; then
+    warn "Image is INCOMPLETE (copy was cancelled or failed)."
+    warn "Do not use this image as a VM — it is missing data."
+    info "To resume or retry, delete ${dst}.incomplete and re-run the option."
+  else
+    verify_image "$dst" || warn "Image may have issues."
+  fi
+  
+  write_image_metadata "$dst" "$src" "$op"
+  print_summary "$op" "$src" "$dst" "$start_ts"
+  pause
+}
+

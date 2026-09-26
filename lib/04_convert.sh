@@ -9,6 +9,8 @@ convert_image() {
   hr
 
   # ── Source image ──
+  echo
+  echo "📥 Step 1: Select the image file to convert"
   local src srcfmt
   src="$(ask_path_existing_file "📥 Enter source image path: ")"
   srcfmt="$(detect_img_format "$src")"
@@ -16,22 +18,19 @@ convert_image() {
   log "Source: $(basename "$src") (format: $srcfmt)"
 
   # ── Destination format ──
-  local dstfmt
+  echo
+  echo "🧩 Step 2: Choose the output format"
+  local dstfmt ext
   dstfmt="$(ask_format_out)"
+  ext="$(fmt_to_ext "$dstfmt")"
 
-  # Warn if same format
+  # Warn if same format (useful for recompaction)
   if [[ "$srcfmt" == "$dstfmt" ]]; then
     warn "Source and destination format are the same ($srcfmt)."
     local cont_ans
     cont_ans="$(ask_yesno "Continue anyway? (useful for recompaction)" "N")"
-    [[ "$cont_ans" == "true" ]] || die "Cancelled."
+    [[ "$cont_ans" == "true" ]] || { user_cancel; return 1; }
   fi
-
-  local ext
-  case "$dstfmt" in
-    qcow2) ext="qcow2" ;; raw) ext="img" ;; vmdk) ext="vmdk" ;;
-    vhdx) ext="vhdx" ;; vpc) ext="vhd" ;; *) ext="img" ;;
-  esac
 
   # ── Compression options (qcow2 only) ──
   local extra=()
@@ -43,63 +42,32 @@ convert_image() {
     fi
   fi
 
-  # ── Output path ──
-  local dst=""
-  local outdir
+  # ── Output path (standard helper: GUI + terminal + overwrite + space) ──
+  echo
+  echo "💾 Step 3: Choose where to save the converted image"
+  local outdir default_path dst
   outdir="$(suggest_out_dir)"
   local base_name
   base_name="$(basename "$src")"
   base_name="${base_name%.*}"
-  local default_path="$outdir/${base_name}.${ext}"
+  default_path="$outdir/${base_name}.${ext}"
 
-  if has_gui; then
-    local gui_path
-    gui_path="$(gui_pick_save_file "Save converted image as" "$default_path")"
-    if [[ -n "$gui_path" ]]; then
-      dst="$gui_path"
-    fi
+  local est_size
+  est_size="$(estimate_image_size "$src" "$dstfmt" "$([[ " ${extra[*]} " == *" -c "* ]] && echo true || echo false)")"
+  # Pass $src as 4th argument to prevent overwriting the source image
+  dst="$(ask_save_path "$default_path" "$ext" "$est_size" "$src")" || return 1
+
+  # ── Convert with live progress ──
+  PB_EMOJI="🔁"
+  local rc=0 start_ts
+  start_ts="$(date +%s)"
+  run_convert_engine "$srcfmt" "$src" "$dstfmt" "$dst" "${extra[@]}" || rc=$?
+  unset PB_EMOJI
+  if (( rc != 0 )); then
+    err "Conversion failed (exit $rc)."
+    [[ -f "$dst" ]] && rm -f "$dst"
+    return 1
   fi
 
-  if [[ -z "$dst" ]]; then
-    echo
-    echo "   Default: $default_path"
-    while true; do
-      read -rp "📁 Save as (full path or just filename): " tmp <"$TTY"
-      if [[ -z "$tmp" ]]; then
-        dst="$default_path"
-        break
-      fi
-      if [[ "$tmp" != */* ]]; then
-        dst="$outdir/$tmp"
-      else
-        dst="$tmp"
-      fi
-      local parent_dir
-      parent_dir="$(dirname "$dst")"
-      if [[ -d "$parent_dir" ]]; then
-        break
-      else
-        warn "Directory not found: $parent_dir — try again."
-      fi
-    done
-  fi
-
-  # ── Overwrite check ──
-  if [[ -e "$dst" ]]; then
-    warn "File exists: $dst"
-    local ow_ans
-    ow_ans="$(ask_yesno "Overwrite it?" "N")"
-    [[ "$ow_ans" == "true" ]] || die "Cancelled."
-    rm -f "$dst"
-  fi
-
-  # ── Convert ──
-  run_convert "$srcfmt" "$src" "$dstfmt" "$dst" "${extra[@]}"
-  qemu-img info "$dst" || true
-  verify_image "$dst" || warn "Image may have issues."
-  write_image_metadata "$dst" "$src" "Converted from $srcfmt to $dstfmt via Option 4"
-
-  echo
-  success "Converted: $src → $dst"
-  pause
+  std_ending "Convert image" "$src" "$dst" "$start_ts"
 }

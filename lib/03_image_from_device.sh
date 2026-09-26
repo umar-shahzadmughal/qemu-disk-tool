@@ -1,12 +1,12 @@
 # ============================================================
 # Option 3: Create an image from a real disk or partition
 # WARNING: Partition images are NOT bootable (data backup only)
-# Includes: smart space check, compression, auto-extension
 # ============================================================
 create_image_from_device() {
   hr
   echo "🧊 Create image from a REAL disk/partition"
   hr
+  local start_ts; start_ts="$(date +%s)"
 
   # ── Source type ──
   echo
@@ -29,24 +29,15 @@ create_image_from_device() {
     warn "The resulting image will NOT be bootable."
     local cont_ans
     cont_ans="$(ask_yesno "Continue with partition imaging?" "Y")"
-    [[ "$cont_ans" == "true" ]] || die "Cancelled."
+    [[ "$cont_ans" == "true" ]] || { user_cancel; return 1; }
   fi
 
-  maybe_unmount "$src"
-
-  # ── Format selection ──
-  local fmt
+  # ── Format + compression (chosen BEFORE unmount: estimate needs mounts) ──
+  local fmt ext
   fmt="$(ask_format_out)"
+  ext="$(fmt_to_ext "$fmt")"
 
-  local ext
-  case "$fmt" in
-    qcow2) ext="qcow2" ;; raw) ext="img" ;; vmdk) ext="vmdk" ;;
-    vhdx) ext="vhdx" ;; vpc) ext="vhd" ;; *) ext="img" ;;
-  esac
-
-  # ── Compression options (qcow2 only) ──
-  local extra=()
-  local is_compressed=false
+  local extra=() is_compressed=false
   if [[ "$fmt" == "qcow2" ]]; then
     local compress
     compress="$(ask_yesno "🗜️  Compress qcow2 output? (smaller file, slower convert)" "Y")"
@@ -56,176 +47,32 @@ create_image_from_device() {
     fi
   fi
 
-  # ── Calculate estimated output size ──
-  local src_size
-  src_size="$(bytes_of_src "$src" 2>/dev/null || echo 0)"
-
+  # ── Estimate BEFORE unmount (measures real used space while mounted) ──
   local est_size
-  if [[ "$fmt" == "raw" ]]; then
-    est_size="$src_size"  # raw = full size
-  else
-    # Try to calculate actual used space from mounted partitions
-    local used_space=0
-    local part_list=()
-    if [[ -b "$src" ]]; then
-      # Source is a partition
-      if mountpoint -q "$src" 2>/dev/null; then
-        used_space="$(df -B1 "$src" 2>/dev/null | tail -1 | awk '{print $3}')"
-      fi
-    else
-      # Source is a disk — sum used space from all partitions
-      while IFS= read -r p; do
-        [[ -b "$p" ]] && part_list+=("$p")
-      done < <(lsblk -nrpo NAME,TYPE "$src" 2>/dev/null | awk '$2=="part"{print $1}')
+  est_size="$(estimate_image_size "$src" "$fmt" "$is_compressed")"
+  # Guard your point 3: never let a 0/invalid estimate skip the space check
+  [[ "$est_size" =~ ^[0-9]+$ && "$est_size" -gt 0 ]] || \
+    est_size="$(bytes_of_src "$src" 2>/dev/null || echo 0)"
+  log "Estimated output size: $(numfmt --to=iec "$est_size")"
+  maybe_unmount "$src" || return 1
 
-      for p in "${part_list[@]}"; do
-        if mountpoint -q "$p" 2>/dev/null; then
-          local p_used
-          p_used="$(df -B1 "$p" 2>/dev/null | tail -1 | awk '{print $3}')"
-          used_space=$((used_space + ${p_used:-0}))
-        fi
-      done
-    fi
+  # ── Output path (standard helper: GUI + terminal + overwrite + space) ──
+  local outdir default_path dst
+  outdir="$(suggest_out_dir)"
+  default_path="$outdir/$(basename "$src")_backup.$ext"
+  dst="$(ask_save_path "$default_path" "$ext" "$est_size")" || return 1
+    assert_dst_not_on_src "$src" "$dst" || return 1
 
-    if ((used_space > 0)); then
-      # Used data + 15% buffer for metadata/overhead
-      est_size=$((used_space * 115 / 100))
-    else
-      # Fallback: estimate based on format
-      if [[ "$is_compressed" == "true" ]]; then
-        est_size=$((src_size * 40 / 100))  # compressed: ~40% estimate
-      else
-        est_size=$((src_size * 70 / 100))  # uncompressed: ~70% estimate
-      fi
-    fi
+  # ── Convert with live progress (pty + total bytes) ──
+  PB_EMOJI="🧊"
+  local rc=0
+  run_convert_engine raw "$src" "$fmt" "$dst" "${extra[@]}" || rc=$?
+  unset PB_EMOJI
+  if (( rc != 0 )); then
+    err "Conversion failed (exit $rc)."
+    [[ -f "$dst" ]] && rm -f "$dst"
+    return 1
   fi
 
-  log "Estimated output size: $(numfmt --to=iec "$est_size")"
-
-   # ── Output path loop (remembers filename, retries on space issues) ──
-  local dst=""
-  local outdir
-  outdir="$(suggest_out_dir)"
-  local src_label
-  src_label="$(basename "$src")"
-  local default_path="$outdir/${src_label}_backup.$ext"
-  local remembered_path="$default_path"
-  local first_attempt=true
-
-    # ── Output path loop ──
-  local dst=""
-  local outdir
-  outdir="$(suggest_out_dir)"
-  local src_label
-  src_label="$(basename "$src")"
-  local default_path="$outdir/${src_label}_backup.$ext"
-  local remembered_path="$default_path"
-
-  # ── Output path loop ──
-  local dst=""
-  local outdir
-  outdir="$(suggest_out_dir)"
-  local src_label
-  src_label="$(basename "$src")"
-  local default_path="$outdir/${src_label}_backup.$ext"
-  local remembered_path="$default_path"
-  local try_gui=true
-
-  while true; do
-    dst=""
-
-    # ── Open GUI only when requested ──
-    if [[ "$try_gui" == "true" ]] && has_gui; then
-      local gui_path
-      gui_path="$(gui_pick_save_file "Save image as" "$remembered_path" || true)"
-      if [[ -n "$gui_path" ]]; then
-        dst="$gui_path"
-      fi
-      try_gui=false  # Don't auto-open GUI on next iteration
-    fi
-
-    # ── Terminal prompt (shown when GUI cancelled or not available) ──
-    if [[ -z "$dst" ]]; then
-      echo
-      echo "   📁 Current path: $remembered_path"
-      if has_gui; then
-        echo "   💡 Type a path, 'gui' to open file picker, or 'cancel' to abort."
-      else
-        echo "   💡 Type a path or 'cancel' to abort."
-      fi
-      if ! read -rp "   ➡️  Save as: " tmp <"$TTY"; then
-        echo
-        die "Cancelled."
-      fi
-
-      if [[ "${tmp,,}" == "cancel" || "${tmp,,}" == "q" ]]; then
-        die "Cancelled."
-      elif [[ "${tmp,,}" == "gui" ]]; then
-        try_gui=true
-        continue
-      elif [[ -z "$tmp" ]]; then
-        dst="$remembered_path"
-      elif [[ "$tmp" != */* ]]; then
-        dst="$outdir/$tmp"
-      else
-        dst="$tmp"
-      fi
-    fi
-
-    # ── Auto-append extension ──
-    if [[ "$dst" != *".$ext" ]]; then
-      dst="${dst}.${ext}"
-    fi
-    remembered_path="$dst"
-
-    # ── Check directory exists ──
-    local parent_dir
-    parent_dir="$(dirname "$dst")"
-    if [[ ! -d "$parent_dir" ]]; then
-      warn "Directory not found: $parent_dir"
-      continue
-    fi
-
-    # ── Overwrite check ──
-    if [[ -e "$dst" ]]; then
-      warn "File exists: $dst"
-      local ow_ans
-      ow_ans="$(ask_yesno "Overwrite it?" "N")"
-      if [[ "$ow_ans" != "true" ]]; then
-        continue
-      fi
-      rm -f "$dst"
-    fi
-
-    # ── Space check ──
-    local avail_space
-    avail_space="$(df -B1 "$parent_dir" 2>/dev/null | awk 'NR==2 {print $4}')"
-    avail_space="${avail_space:-0}"
-
-    if ((est_size > avail_space)); then
-      echo
-      err "Not enough disk space in $parent_dir"
-      echo "   Estimated size: $(numfmt --to=iec "$est_size")"
-      echo "   Available:      $(numfmt --to=iec "$avail_space")"
-      echo
-      warn "Choose a different directory."
-      continue  # → shows terminal prompt (NOT GUI)
-    fi
-
-    # ── Confirmed ──
-    echo
-    success "Output confirmed: $dst"
-    log "Space check: $(numfmt --to=iec "$avail_space") available ✅"
-    break
-  done
-
-  # ── Convert ──
-  run_convert raw "$src" "$fmt" "$dst" "${extra[@]}"
-  qemu-img info "$dst" || true
-  verify_image "$dst" || warn "Image may have issues."
-  write_image_metadata "$dst" "$src" "Created from real device via Option 3"
-
-  echo
-  success "Image created: $dst"
-  pause
+  std_ending "Image from device" "$src" "$dst" "$start_ts"
 }

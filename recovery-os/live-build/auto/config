@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")/.."
+
+lb config noauto \
+    --mode debian \
+    --distribution bookworm \
+    --architectures amd64 \
+    --linux-flavours amd64 \
+    --binary-image iso-hybrid \
+    --system live \
+    --initramfs live-boot \
+    --initsystem systemd \
+    --bootloaders "grub-pc grub-efi" \
+    --uefi-secure-boot enable \
+    --debian-installer none \
+    --archive-areas "main contrib non-free non-free-firmware" \
+    --mirror-bootstrap "https://deb.debian.org/debian/" \
+    --mirror-chroot "https://deb.debian.org/debian/" \
+    --mirror-binary "https://deb.debian.org/debian/" \
+    --mirror-chroot-security "https://security.debian.org/debian-security/" \
+    --mirror-binary-security "https://security.debian.org/debian-security/" \
+    --security true \
+    --updates true \
+    --apt-secure true \
+    --apt-recommends true \
+    --firmware-chroot true \
+    --firmware-binary true \
+    --checksums sha256 \
+    --image-name "qdt-recovery-os" \
+    --iso-application "QEMU Disk Tool Recovery OS" \
+    --iso-publisher "QEMU Disk Tool" \
+    --iso-volume "QDT_RECOVERY_OS" \
+    --bootappend-live "boot=live components nopersistence noeject username=root systemd.hostname=Qemu-Disk-Tool-Recovery-OS"

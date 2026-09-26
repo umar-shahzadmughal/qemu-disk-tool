@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+mkdir -p /etc/systemd/system/multi-user.target.wants
+
+if [ -e /lib/systemd/system/NetworkManager.service ]; then
+    ln -sf /lib/systemd/system/NetworkManager.service \
+        /etc/systemd/system/multi-user.target.wants/NetworkManager.service
+fi

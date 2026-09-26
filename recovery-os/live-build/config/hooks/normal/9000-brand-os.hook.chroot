@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ -f /etc/os-release ]; then
+    sed -i \
+        's/^NAME=.*/NAME="QEMU Disk Tool Recovery OS"/' \
+        /etc/os-release
+
+    sed -i \
+        's/^PRETTY_NAME=.*/PRETTY_NAME="QEMU Disk Tool Recovery OS"/' \
+        /etc/os-release
+fi

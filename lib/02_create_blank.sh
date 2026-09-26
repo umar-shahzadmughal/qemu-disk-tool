@@ -7,187 +7,103 @@ create_blank_disk() {
   echo "🧱 Create a NEW blank virtual disk image"
   hr
 
-  # ── Ask format first (determines file extension) ──
-  local fmt
+  # ── Format first (determines extension) ──
+  local fmt ext
   fmt="$(ask_format_out)"
+  ext="$(fmt_to_ext "$fmt")"
 
-  # ── Ask size with validation ──
-  local size
-  while true; do
-    read -rp "📏 Size (e.g., 20G, 500G, 1T): " size <"$TTY"
-    if [[ -z "$size" ]]; then
-      warn "Size cannot be empty."
-      continue
-    fi
-    if [[ ! "$size" =~ ^[0-9]+[bBkKmMgGtTpPeE]?$ ]]; then
-      warn "Invalid format. Use numbers followed by K, M, G, or T (e.g., 50G)."
-      continue
-    fi
-    
-    # Convert to bytes for validation
-    local size_bytes
-    size_bytes="$(numfmt --from=auto "$size" 2>/dev/null)" || {
-      warn "Could not parse size."
-      continue
-    }
-    
-    # Reasonable bounds: 1MB to 64TB
-    if (( size_bytes < 1048576 )); then
-      warn "Size too small (minimum 1M)."
-      continue
-    fi
-    if (( size_bytes > 70368744177664 )); then
-      warn "Size too large (maximum 64T)."
-      continue
-    fi
-    break
-  done
+  # ── Size (validated + bounded by common helper) ──
+  local size size_bytes
+  size="$(ask_size "📏 Size (e.g., 20G, 500G, 1T)")" || return 1
+  size_bytes="$(numfmt --from=auto "$size")"
 
   # ── Format-specific options ──
   local -a create_opts=()
-  local qcow_opt="" raw_opt=""
-  
+  local prealloc="sparse"
+
   if [[ "$fmt" == "qcow2" ]]; then
-    echo
-    echo "  QCOW2 Options:"
-    echo "  [1] Standard (sparse, grows as needed)"
-    echo "  [2] Preallocated metadata (faster snapshots)"
-    echo "  [3] Fully preallocated (fastest I/O, uses full disk space now)"
-    echo
+    { echo
+      echo "  QCOW2 Options:"
+      echo "  [1] Standard (sparse, grows as needed)"
+      echo "  [2] Preallocated metadata (faster snapshots)"
+      echo "  [3] Fully preallocated (fastest I/O, uses full disk space now)"
+      echo
+    } >&2
+    local qcow_opt
     read -rp "➡️  Choose (1-3) [1]: " qcow_opt <"$TTY"
     qcow_opt="${qcow_opt:-1}"
-    
     case "$qcow_opt" in
-      2) create_opts+=(-o preallocation=metadata) ;;
-      3) create_opts+=(-o preallocation=falloc) ;;
+      2) create_opts+=(-o preallocation=metadata); prealloc="metadata" ;;
+      3) create_opts+=(-o preallocation=falloc);   prealloc="falloc" ;;
     esac
-    
-    # Offer compression
-    if [[ "$qcow_opt" != "3" ]]; then
-      echo
-      read -rp "🗜️  Enable compression? (y/N): " comp <"$TTY"
-      if [[ "${comp,,}" == "y" ]]; then
-        # Fix: -c is not valid for qemu-img create. Use -o compression_type instead.
+    if [[ "$prealloc" != "falloc" ]]; then
+      local comp
+      comp="$(ask_yesno "🗜️  Set zstd compression type for future writes?" "N")"
+      if [[ "$comp" == "true" ]]; then
         create_opts+=(-o compression_type=zstd)
-        info "Compression enabled (zstd - faster and better compression)"
+        info "zstd compression type set (applies to data written later)."
       fi
     fi
-    
+
   elif [[ "$fmt" == "raw" ]]; then
-    echo
-    echo "  RAW Options:"
-    echo "  [1] Sparse file (instant creation, grows as needed)"
-    echo "  [2] Fully allocated (slower creation, guaranteed disk space)"
-    echo
+    { echo
+      echo "  RAW Options:"
+      echo "  [1] Sparse file (instant creation, grows as needed)"
+      echo "  [2] Fully allocated (slower creation, guaranteed disk space)"
+      echo
+    } >&2
+    local raw_opt
     read -rp "➡️  Choose (1-2) [1]: " raw_opt <"$TTY"
-    raw_opt="${raw_opt:-1}"
-    
-    if [[ "$raw_opt" == "2" ]]; then
-      info "Full allocation: this may take several minutes for large disks…"
-    fi
+    [[ "${raw_opt:-1}" == "2" ]] && prealloc="full"
   fi
 
-  # ── Ask output path (GUI or terminal) ──
-  local ext
-  case "$fmt" in
-    qcow2) ext="qcow2" ;; raw) ext="img" ;; vmdk) ext="vmdk" ;;
-    vhdx) ext="vhdx" ;; vpc) ext="vhd" ;; *) ext="img" ;;
-  esac
+  # ── Disk space actually needed AT CREATION TIME ──
+  local alloc_bytes=1048576                      # sparse: metadata only
+  [[ "$prealloc" == "metadata" ]] && alloc_bytes=16777216   # L1/L2/refcount tables
+  [[ "$prealloc" == "falloc" || "$prealloc" == "full" ]] && alloc_bytes="$size_bytes"
 
-  local dst=""
-  local outdir
+  # ── Output path (standard helper: GUI + terminal + overwrite + space) ──
+  local outdir default_path dst
   outdir="$(suggest_out_dir)"
-  local default_path="$outdir/new_disk.$ext"
+  default_path="$outdir/new_disk_${size}.$ext"
+  dst="$(ask_save_path "$default_path" "$ext" "$alloc_bytes")" || return 1
 
-  if has_gui; then
-    local gui_path
-    gui_path="$(gui_pick_save_file "Save new disk image as" "$default_path")"
-    if [[ -n "$gui_path" ]]; then
-      dst="$gui_path"
-    fi
-  fi
+  # ── Create (timer starts here — excludes interactive prompt time) ──
+  local start_ts; start_ts="$(date +%s)"
 
-  if [[ -z "$dst" ]]; then
-    echo
-    echo "   Default: $default_path"
-    while true; do
-      read -rp "📁 Save as (full path or just filename): " tmp <"$TTY"
-      if [[ -z "$tmp" ]]; then
-        dst="$default_path"
-        break
-      fi
-      if [[ "$tmp" != */* ]]; then
-        tmp="$outdir/$tmp"
-      fi
-      # Ensure correct extension
-      if [[ "$tmp" != *".$ext" ]]; then
-        tmp="$tmp.$ext"
-      fi
-      dst="$tmp"
-      local parent_dir
-      parent_dir="$(dirname "$dst")"
-      if [[ -d "$parent_dir" ]]; then
-        break
-      else
-        warn "Directory not found: $parent_dir — try again."
-      fi
-    done
-  fi
-
-  # ── Overwrite check ──
-  if [[ -e "$dst" ]]; then
-    warn "File exists: $dst"
-    local ow_ans
-    ow_ans="$(ask_yesno "Overwrite?" "N")"
-    [[ "$ow_ans" == "true" ]] || die "Cancelled."
-    rm -f "$dst"
-  fi
-
-  # ── Create the image ──
-  local start_ts
-  start_ts="$(date +%s)"
-  
-  if [[ "$fmt" == "raw" && "${raw_opt:-1}" == "1" ]]; then
-    # Sparse raw file - instant
+  if [[ "$fmt" == "raw" && "$prealloc" == "sparse" ]]; then
     log "Creating sparse raw image ($size)…"
-    truncate -s "$size" "$dst" || die "Failed to create sparse file."
-  elif [[ "$fmt" == "raw" && "${raw_opt:-1}" == "2" ]]; then
-    # Full allocation raw - use dd with progress
-    log "Creating fully allocated raw image ($size)…"
-    local size_bytes
-    size_bytes="$(numfmt --from=auto "$size")"
-    
+    truncate -s "$size" "$dst" || { err "Failed to create sparse file."; rm -f "$dst" 2>/dev/null; return 1; }
+
+  elif [[ "$fmt" == "raw" && "$prealloc" == "full" ]]; then
     PB_EMOJI="🧱"
     PB_TOTAL="$size_bytes"
-    PB_HEADER="$(basename "$dst")"
-    if ! run_with_progress_bar "Allocating disk space…" "$size_bytes" \
-      dd if=/dev/zero of="$dst" bs=1M status=progress; then
-      unset PB_EMOJI PB_TOTAL PB_HEADER
-      die "Failed to allocate disk space."
+    PB_HEADER="/dev/zero → $dst"
+    PB_SUBLINE="full allocation · $size · raw"
+    local rc=0
+    run_with_progress_bar "Writing zero blocks (full allocation)…" "$size_bytes" \
+      dd if=/dev/zero of="$dst" bs=1M status=progress || rc=$?
+    unset PB_EMOJI PB_TOTAL PB_HEADER PB_SUBLINE
+    if (( rc != 0 )); then
+      err "Failed to allocate disk space."
+      rm -f "$dst"; return 1
     fi
-    unset PB_EMOJI PB_TOTAL PB_HEADER
+
   else
-    # qemu-img create with options
-    log "Creating $fmt image ($size)…"
-    if ! qemu-img create -f "$fmt" "${create_opts[@]}" "$dst" "$size" >/dev/null; then
-      die "qemu-img create failed."
-    fi
+    log "Creating $fmt image ($size, $prealloc)…"
+    qemu-img create -f "$fmt" "${create_opts[@]}" "$dst" "$size" >&2 || {
+      err "qemu-img create failed."
+      rm -f "$dst" 2>/dev/null
+      return 1
+    }
   fi
 
-  # ── Verify ──
+  # ── Show result ──
   echo
-  qemu-img info "$dst" || warn "Could not read image info."
-  verify_image "$dst" || warn "Image may have issues."
-
-  # ── Summary ──
-  print_summary "Create blank image" "-" "$dst" "$start_ts"
-  
-  echo
-  success "Created: $dst"
-  
-  if [[ "$fmt" == "raw" && "${raw_opt:-1}" == "1" ]]; then
+  qemu-img info "$dst" >&2 || warn "Could not read image info."
+  [[ "$prealloc" == "sparse" ]] && \
     info "Sparse file: uses minimal disk space now, grows as you write data."
-  fi
-  
-  pause
+  success "Created: $dst"
+
+  std_ending "Create blank image" "-" "$dst" "$start_ts"
 }
